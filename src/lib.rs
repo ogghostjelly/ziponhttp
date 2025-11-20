@@ -1,7 +1,8 @@
 #![allow(clippy::let_unit_value)]
 
 use std::{
-    io::{self, BufReader, Read},
+    fs::File,
+    io::{self, BufReader, Read, Seek, SeekFrom},
     num::ParseIntError,
 };
 
@@ -68,7 +69,32 @@ pub struct ZipReader<R: Read> {
     maximum_allowed_offset: usize,
 }
 
-impl ZipReader<BufReader<BodyReader<'static>>> {
+impl ZipReader<io::Take<File>> {
+    pub fn from_file(mut file: File, filesize: Option<usize>) -> Result<Self> {
+        let filesize = match filesize {
+            Some(filesize) => filesize,
+            None => file.metadata()?.len() as usize,
+        };
+
+        let Some(eocd) = retrieve_eocd(&mut file, filesize)? else {
+            return Err(Error::EocdNotFound);
+        };
+
+        Self::from_eocd(file, &eocd)
+    }
+
+    pub fn from_eocd(mut file: File, eocd: &Eocd) -> Result<Self> {
+        let from = eocd.cd_offset;
+        let to = eocd.cd_offset as u64 + eocd.cd_size;
+
+        file.seek(SeekFrom::Start(from))?;
+        let reader = file.take(to);
+
+        Ok(Self::from_cdfh_reader(reader, eocd.offset))
+    }
+}
+
+impl ZipReader<BodyReader<'static>> {
     pub fn get(agent: &Agent, uri: &Uri, filesize: Option<usize>) -> Result<Self> {
         let filesize = match filesize {
             Some(filesize) => filesize,
@@ -91,9 +117,19 @@ impl ZipReader<BufReader<BodyReader<'static>>> {
             .header("Range", format!("bytes={from}-{to}"))
             .call()?;
 
-        let reader = BufReader::new(resp.into_body().into_reader());
+        let reader = resp.into_body().into_reader();
 
         Ok(Self::from_cdfh_reader(reader, eocd.offset))
+    }
+}
+
+impl<R: Read + 'static> ZipReader<R> {
+    pub fn boxed(self) -> ZipReader<Box<dyn io::Read>> {
+        ZipReader {
+            reader: Box::new(self.reader),
+            buf: self.buf,
+            maximum_allowed_offset: self.maximum_allowed_offset,
+        }
     }
 }
 
@@ -132,10 +168,10 @@ impl<R: Read> Iterator for ZipReader<R> {
     }
 }
 
-fn request_eocd(agent: &Agent, uri: &Uri, filesize: usize) -> Result<Option<Eocd>> {
-    const CHUNK_SIZE: usize = 256;
+const EOCD_CHUNK_SIZE: usize = 256;
 
-    let from = filesize - CHUNK_SIZE;
+fn request_eocd(agent: &Agent, uri: &Uri, filesize: usize) -> Result<Option<Eocd>> {
+    let from = filesize - EOCD_CHUNK_SIZE;
     let to = filesize - 1;
 
     let resp = agent
@@ -143,7 +179,17 @@ fn request_eocd(agent: &Agent, uri: &Uri, filesize: usize) -> Result<Option<Eocd
         .header("Range", format!("bytes={from}-{to}"))
         .call()?;
 
-    let mut reader = BufReader::with_capacity(CHUNK_SIZE, resp.into_body().into_reader());
+    find_eocd(from, resp.into_body().into_reader(), filesize)
+}
+
+fn retrieve_eocd(file: &mut File, filesize: usize) -> Result<Option<Eocd>> {
+    file.seek(SeekFrom::End(-(EOCD_CHUNK_SIZE as i64)))?;
+    let from = file.stream_position()? as usize;
+    find_eocd(from, file, filesize)
+}
+
+fn find_eocd<R: io::Read>(from: usize, reader: R, filesize: usize) -> Result<Option<Eocd>> {
+    let mut reader = BufReader::with_capacity(EOCD_CHUNK_SIZE, reader);
     let mut buf = [0u8; 4];
     let mut byte_offset = 0;
 
