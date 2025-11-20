@@ -88,12 +88,12 @@ impl ZipReader<BufReader<BodyReader<'static>>> {
 
         let reader = BufReader::new(resp.into_body().into_reader());
 
-        Ok(Self::new(reader, eocd.offset))
+        Ok(Self::from_cdfh_reader(reader, eocd.offset))
     }
 }
 
 impl<R: Read> ZipReader<R> {
-    pub fn new(reader: R, maximum_allowed_offset: usize) -> Self {
+    pub fn from_cdfh_reader(reader: R, maximum_allowed_offset: usize) -> Self {
         Self {
             reader,
             buf: [0u8; 4],
