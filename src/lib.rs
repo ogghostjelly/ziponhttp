@@ -33,6 +33,12 @@ pub fn extract_file(
     Err(Error::CdFileNotFound)
 }
 
+pub fn is_zip_file<R: io::Read>(mut reader: R) -> io::Result<bool> {
+    let mut buf = [0u8; 4];
+    reader.read_exact(&mut buf)?;
+    Ok(buf == "PK\x03\x04".as_bytes())
+}
+
 pub fn read_file(agent: &Agent, uri: &Uri, cdfh: &Cdfh) -> Result<impl io::Read + use<>> {
     let resp = agent
         .get(uri)
