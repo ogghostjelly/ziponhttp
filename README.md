@@ -1,10 +1,41 @@
 # Extract PKZIP from HTTP
 
-> [!WARNING]
-> Don't depend on this repository, it is not a library!
-> It is simply meant to demonstrate extracting a file from a zip over HTTP.
-> I'll probably rewrite this with `reqwest` and use it in `ferium` for dependency resolution.
+Extract only the files you need from a zip using HTTP range requests.
 
-A specialized zip decompresser that extracts a single file from a zip using HTTP range requests. Only supports files using DEFLATE compression. Blocking and uses `ureq` for HTTP requests.
+The library is very minimal and may not support all types of zip formats.
 
-Might work for Zip64 formats?? I haven't tested it... doesn't matter anyway since most jar files don't seem to use it.
+Uses [ureq](https://github.com/algesten/ureq) and is blocking. For the async counterpart see [ziponline](https://github.com/ogghostjelly/ziponline) (ziponline is not a drop-in replacement, it has a similar but different api).
+
+# Limitations
+
+Currently only supports DEFLATE decompression and only supports EOCD headers that are less than 256 bytes in size.
+
+# Examples
+
+```rust
+let mut reader = ziponhttp::extract_file(
+    agent,         // ureq::Agent
+    url,           // url to zip file
+    filesize,      // size of zip file (can be set to None).
+    "filename.txt" // file to extract
+)?;
+
+io::copy(&mut reader, ...);
+```
+
+```rust
+let zipfile = ziponhttp::ZipReader::get(
+    agent,         // ureq::Agent
+    url,           // url to zip file
+    filesize,      // size of zip file (can be set to None).
+)?;
+
+for file in zipfile {
+    let file = file?;
+    if file.filename.ends_with(".txt") {
+        let rdr = ziponhttp::read_file(agent, url, &file)?;
+        let content = io::read_to_string(rdr)?;
+        println!("The text file says: {content}");
+    }
+}
+```

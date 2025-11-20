@@ -1,10 +1,14 @@
 [package]
-name = "extract-zip-from-http"
+name = "ziponhttp"
 version = "0.1.0"
 edition = "2024"
 
+authors = ["OgGhostJelly"]
 license = "MIT"
-repository = "https://github.com/OgGhostJelly/extract-zip-from-http"
+description = "Extract only what you need from zip files using HTTP range requests. Small & Minimalist."
+repository = "https://github.com/OgGhostJelly/ziponhttp"
+keywords = ["archive", "compression", "zip"]
+categories = ["compression"]
 
 [dependencies]
 inflate = "0.4.5"

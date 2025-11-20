@@ -8,7 +8,7 @@ use std::{
 use read_ext::ReadExt;
 use structs::{Cdfh, CompressionMethod, Eocd, Eocd32, Eocd64};
 use ureq::{
-    Agent,
+    Agent, BodyReader,
     http::{Uri, header::ToStrError},
 };
 
@@ -17,25 +17,23 @@ mod structs;
 
 pub fn extract_file(
     agent: &Agent,
-    uri: Uri,
+    uri: &Uri,
     filesize: Option<usize>,
     name: &str,
 ) -> Result<impl io::Read> {
-    let start = std::time::Instant::now();
-    let filesize = match filesize {
-        Some(filesize) => filesize,
-        None => request_content_length(agent, &uri)?,
-    };
-    println!(
-        "Got Content-Length in {:?}",
-        std::time::Instant::now() - start
-    );
+    let zip = ZipReader::get(agent, uri, filesize)?;
 
-    let Some(cdfh) = find_in_central_directory(agent, &uri, filesize, name)? else {
-        return Err(Error::FileNotFound);
-    };
+    for cdfh in zip {
+        let cdfh = cdfh?;
+        if cdfh.filename == name {
+            return read_file(agent, uri, &cdfh);
+        }
+    }
 
-    let start = std::time::Instant::now();
+    Err(Error::CdFileNotFound)
+}
+
+pub fn read_file(agent: &Agent, uri: &Uri, cdfh: &Cdfh) -> Result<impl io::Read + use<>> {
     let resp = agent
         .get(uri)
         .header("Range", format!("bytes={}-", cdfh.file_header_offset))
@@ -56,57 +54,77 @@ pub fn extract_file(
     let reader = reader.take(cdfh.compressed_size as u64);
     let reader = inflate::DeflateDecoder::new(reader);
 
-    println!("Got File Header in {:?}", std::time::Instant::now() - start);
-
     Ok(reader)
 }
 
-/// Find the central directory entry of a file.
-///
-/// # Errors
-/// If HTTP range requests are not supported.
-fn find_in_central_directory(
-    agent: &Agent,
-    uri: &Uri,
-    filesize: usize,
-    name: &str,
-) -> Result<Option<Cdfh>> {
-    let start = std::time::Instant::now();
-    let Some(eocd) = request_eocd(agent, uri, filesize)? else {
-        return Err(Error::MissingEocd);
-    };
-    println!("Got EOCD in {:?}", std::time::Instant::now() - start);
+pub struct ZipReader<R: Read> {
+    reader: R,
+    buf: [u8; 4],
+    maximum_allowed_offset: usize,
+}
 
-    let from = eocd.cd_offset;
-    let to = eocd.cd_offset as u64 + eocd.cd_size;
+impl ZipReader<BufReader<BodyReader<'static>>> {
+    pub fn get(agent: &Agent, uri: &Uri, filesize: Option<usize>) -> Result<Self> {
+        let filesize = match filesize {
+            Some(filesize) => filesize,
+            None => request_content_length(agent, uri)?,
+        };
 
-    let start = std::time::Instant::now();
+        let Some(eocd) = request_eocd(agent, uri, filesize)? else {
+            return Err(Error::EocdNotFound);
+        };
 
-    let resp = agent
-        .get(uri)
-        .header("Range", format!("bytes={from}-{to}"))
-        .call()?;
+        Self::from_eocd(agent, uri, &eocd)
+    }
 
-    let mut reader = BufReader::new(resp.into_body().into_reader());
-    let mut buf: [u8; 4] = [0u8; 4];
+    pub fn from_eocd(agent: &Agent, uri: &Uri, eocd: &Eocd) -> Result<Self> {
+        let from = eocd.cd_offset;
+        let to = eocd.cd_offset as u64 + eocd.cd_size;
 
-    while let Some(value) = (&mut reader).bytes().next() {
-        let value = value?;
+        let resp = agent
+            .get(uri)
+            .header("Range", format!("bytes={from}-{to}"))
+            .call()?;
 
-        buf[0] = value;
-        buf.rotate_left(1);
+        let reader = BufReader::new(resp.into_body().into_reader());
 
-        if buf == *b"PK\x01\x02" {
-            if let Some(cdfh) = read_cdfh(&mut reader, eocd.offset)? {
-                if cdfh.filename == name {
-                    println!("Got CDFH in {:?}", std::time::Instant::now() - start);
+        Ok(Self::new(reader, eocd.offset))
+    }
+}
+
+impl<R: Read> ZipReader<R> {
+    pub fn new(reader: R, maximum_allowed_offset: usize) -> Self {
+        Self {
+            reader,
+            buf: [0u8; 4],
+            maximum_allowed_offset,
+        }
+    }
+
+    pub fn next(&mut self) -> Result<Option<Cdfh>> {
+        while let Some(value) = (&mut self.reader).bytes().next() {
+            let value = value?;
+
+            self.buf[0] = value;
+            self.buf.rotate_left(1);
+
+            if self.buf == *b"PK\x01\x02" {
+                if let Some(cdfh) = read_cdfh(&mut self.reader, self.maximum_allowed_offset)? {
                     return Ok(Some(cdfh));
                 }
             }
         }
-    }
 
-    Ok(None)
+        Ok(None)
+    }
+}
+
+impl<R: Read> Iterator for ZipReader<R> {
+    type Item = Result<Cdfh>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next().transpose()
+    }
 }
 
 fn request_eocd(agent: &Agent, uri: &Uri, filesize: usize) -> Result<Option<Eocd>> {
@@ -360,11 +378,11 @@ pub enum Error {
     #[error("missing content length")]
     MissingContentLength,
     #[error("file not found")]
-    FileNotFound,
+    CdFileNotFound,
     #[error("{0}")]
     Io(#[from] io::Error),
     #[error("missing eocd")]
-    MissingEocd,
+    EocdNotFound,
     #[error("malformed file header")]
     MalformedFileHeader,
 }
