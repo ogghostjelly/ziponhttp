@@ -15,6 +15,11 @@ use ureq::{
 mod read_ext;
 mod structs;
 
+pub const CDFH: &[u8] = b"PK\x01\x02";
+pub const FH: &[u8] = b"PK\x03\x04";
+pub const EOCD: &[u8] = b"PK\x05\x06";
+pub const EOCD64: &[u8] = b"PK\x06\x06";
+
 pub fn extract_file(
     agent: &Agent,
     uri: &Uri,
@@ -33,12 +38,6 @@ pub fn extract_file(
     Err(Error::CdFileNotFound)
 }
 
-pub fn is_zip_file<R: io::Read>(mut reader: R) -> io::Result<bool> {
-    let mut buf = [0u8; 4];
-    reader.read_exact(&mut buf)?;
-    Ok(buf == "PK\x03\x04".as_bytes())
-}
-
 pub fn read_file(agent: &Agent, uri: &Uri, cdfh: &Cdfh) -> Result<impl io::Read + use<>> {
     let resp = agent
         .get(uri)
@@ -49,7 +48,7 @@ pub fn read_file(agent: &Agent, uri: &Uri, cdfh: &Cdfh) -> Result<impl io::Read 
 
     let mut signature = [0; 4];
     reader.read_exact(&mut signature)?;
-    if signature != *b"PK\x03\x04" {
+    if signature != *FH {
         return Err(Error::MalformedFileHeader);
     }
 
@@ -114,7 +113,7 @@ impl<R: Read> ZipReader<R> {
             self.buf[0] = value;
             self.buf.rotate_left(1);
 
-            if self.buf == *b"PK\x01\x02" {
+            if self.buf == *CDFH {
                 if let Some(cdfh) = read_cdfh(&mut self.reader, self.maximum_allowed_offset)? {
                     return Ok(Some(cdfh));
                 }
@@ -154,13 +153,13 @@ fn request_eocd(agent: &Agent, uri: &Uri, filesize: usize) -> Result<Option<Eocd
         buf[0] = value;
         buf.rotate_left(1);
 
-        if buf == *b"PK\x05\x06" {
+        if buf == *EOCD {
             if let MaybeEocd32::Eocd32(value) =
                 read_eocd32(&mut reader, from + byte_offset, filesize)?
             {
                 return Ok(Some(value.into()));
             }
-        } else if buf == *b"PK\x06\x06" {
+        } else if buf == *EOCD64 {
             if let Some(value) = read_eocd64(&mut reader, from + byte_offset)? {
                 return Ok(Some(value.into()));
             }
