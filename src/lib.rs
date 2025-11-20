@@ -14,7 +14,7 @@ use ureq::{
 };
 
 mod read_ext;
-mod structs;
+pub mod structs;
 
 pub const CDFH: &[u8] = b"PK\x01\x02";
 pub const FH: &[u8] = b"PK\x03\x04";
