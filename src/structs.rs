@@ -3,6 +3,11 @@
     reason = "unused fields still need to be parsed so may as well store them"
 )]
 
+pub const SIGNATURE_CDFH: &[u8] = b"PK\x01\x02";
+pub const SIGNATURE_FH: &[u8] = b"PK\x03\x04";
+pub const SIGNATURE_EOCD: &[u8] = b"PK\x05\x06";
+pub const SIGNATURE_EOCD64: &[u8] = b"PK\x06\x06";
+
 /// End of central directory record.
 #[derive(Debug)]
 pub struct Eocd {

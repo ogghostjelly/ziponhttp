@@ -4,6 +4,7 @@ use std::{
     fs::File,
     io::{self, BufReader, Read, Seek, SeekFrom},
     num::ParseIntError,
+    path::Path,
 };
 
 use read_ext::ReadExt;
@@ -13,13 +14,10 @@ use ureq::{
     http::{Uri, header::ToStrError},
 };
 
+use crate::structs::{SIGNATURE_CDFH, SIGNATURE_EOCD, SIGNATURE_EOCD64, SIGNATURE_FH};
+
 mod read_ext;
 pub mod structs;
-
-pub const CDFH: &[u8] = b"PK\x01\x02";
-pub const FH: &[u8] = b"PK\x03\x04";
-pub const EOCD: &[u8] = b"PK\x05\x06";
-pub const EOCD64: &[u8] = b"PK\x06\x06";
 
 pub fn extract_file(
     agent: &Agent,
@@ -45,11 +43,24 @@ pub fn read_file(agent: &Agent, uri: &Uri, cdfh: &Cdfh) -> Result<impl io::Read 
         .header("Range", format!("bytes={}-", cdfh.file_header_offset))
         .call()?;
 
-    let mut reader = BufReader::new(resp.into_body().into_reader());
+    let reader = BufReader::new(resp.into_body().into_reader());
 
+    read_fh_with_signature(reader)
+}
+
+pub fn read_file_seekable<R: Read + Seek>(
+    mut reader: R,
+    cdfh: &Cdfh,
+) -> Result<impl io::Read + use<R>> {
+    reader.seek(SeekFrom::Start(cdfh.file_header_offset as u64))?;
+
+    read_fh_with_signature(reader)
+}
+
+fn read_fh_with_signature<R: Read>(mut reader: R) -> Result<impl io::Read + use<R>> {
     let mut signature = [0; 4];
     reader.read_exact(&mut signature)?;
-    if signature != *FH {
+    if signature != *SIGNATURE_FH {
         return Err(Error::MalformedFileHeader);
     }
 
@@ -57,10 +68,57 @@ pub fn read_file(agent: &Agent, uri: &Uri, cdfh: &Cdfh) -> Result<impl io::Read 
         return Err(Error::MalformedFileHeader);
     };
 
-    let reader = reader.take(cdfh.compressed_size as u64);
-    let reader = inflate::DeflateDecoder::new(reader);
-
     Ok(reader)
+}
+
+pub struct AnyZipReader(AnyZipReaderIn);
+
+enum AnyZipReaderIn {
+    File {
+        reader: ZipReader<io::Take<File>>,
+        file: File,
+    },
+    Http {
+        agent: Agent,
+        uri: Uri,
+        reader: ZipReader<BodyReader<'static>>,
+    },
+}
+
+impl AnyZipReader {
+    pub fn open<P: AsRef<Path>>(path: P, filesize: Option<usize>) -> Result<Self> {
+        Self::from_file(File::open(path)?, filesize)
+    }
+
+    pub fn from_file(file: File, filesize: Option<usize>) -> Result<Self> {
+        let filesize = match filesize {
+            Some(filesize) => filesize,
+            None => file.metadata()?.len() as usize,
+        };
+        let reader = ZipReader::from_seekable(file.try_clone()?, Some(filesize))?;
+        Ok(Self(AnyZipReaderIn::File { reader, file }))
+    }
+
+    pub fn get(agent: Agent, uri: Uri, filesize: Option<usize>) -> Result<Self> {
+        let reader = ZipReader::get(&agent, &uri, filesize)?;
+        Ok(Self(AnyZipReaderIn::Http { agent, uri, reader }))
+    }
+
+    pub fn read_file<'r>(&self, cdfh: &Cdfh) -> Result<Box<dyn io::Read>> {
+        match &self.0 {
+            AnyZipReaderIn::File { file, .. } => {
+                Ok(Box::new(read_file_seekable(file.try_clone()?, cdfh)?))
+            }
+            AnyZipReaderIn::Http { agent, uri, .. } => Ok(Box::new(read_file(agent, uri, cdfh)?)),
+        }
+    }
+
+    pub fn next(&mut self) -> Result<Option<Cdfh>> {
+        match &mut self.0 {
+            AnyZipReaderIn::File { reader, .. } => reader.next(),
+            AnyZipReaderIn::Http { reader, .. } => reader.next(),
+        }
+    }
 }
 
 pub struct ZipReader<R: Read> {
@@ -69,26 +127,26 @@ pub struct ZipReader<R: Read> {
     maximum_allowed_offset: usize,
 }
 
-impl ZipReader<io::Take<File>> {
-    pub fn from_file(mut file: File, filesize: Option<usize>) -> Result<Self> {
+impl<R: Read + Seek> ZipReader<io::Take<R>> {
+    pub fn from_seekable(mut reader: R, filesize: Option<usize>) -> Result<Self> {
         let filesize = match filesize {
             Some(filesize) => filesize,
-            None => file.metadata()?.len() as usize,
+            None => reader.stream_position()? as usize,
         };
 
-        let Some(eocd) = retrieve_eocd(&mut file, filesize)? else {
+        let Some(eocd) = retrieve_eocd(&mut reader, filesize)? else {
             return Err(Error::EocdNotFound);
         };
 
-        Self::from_eocd(file, &eocd)
+        Self::from_eocd(reader, &eocd)
     }
 
-    pub fn from_eocd(mut file: File, eocd: &Eocd) -> Result<Self> {
+    fn from_eocd(mut reader: R, eocd: &Eocd) -> Result<Self> {
         let from = eocd.cd_offset;
         let to = eocd.cd_offset as u64 + eocd.cd_size;
 
-        file.seek(SeekFrom::Start(from))?;
-        let reader = file.take(to);
+        reader.seek(SeekFrom::Start(from))?;
+        let reader = reader.take(to);
 
         Ok(Self::from_cdfh_reader(reader, eocd.offset))
     }
@@ -108,7 +166,7 @@ impl ZipReader<BodyReader<'static>> {
         Self::from_eocd(agent, uri, &eocd)
     }
 
-    pub fn from_eocd(agent: &Agent, uri: &Uri, eocd: &Eocd) -> Result<Self> {
+    fn from_eocd(agent: &Agent, uri: &Uri, eocd: &Eocd) -> Result<Self> {
         let from = eocd.cd_offset;
         let to = eocd.cd_offset as u64 + eocd.cd_size;
 
@@ -134,7 +192,7 @@ impl<R: Read + 'static> ZipReader<R> {
 }
 
 impl<R: Read> ZipReader<R> {
-    pub fn from_cdfh_reader(reader: R, maximum_allowed_offset: usize) -> Self {
+    fn from_cdfh_reader(reader: R, maximum_allowed_offset: usize) -> Self {
         Self {
             reader,
             buf: [0u8; 4],
@@ -149,7 +207,7 @@ impl<R: Read> ZipReader<R> {
             self.buf[0] = value;
             self.buf.rotate_left(1);
 
-            if self.buf == *CDFH {
+            if self.buf == *SIGNATURE_CDFH {
                 if let Some(cdfh) = read_cdfh(&mut self.reader, self.maximum_allowed_offset)? {
                     return Ok(Some(cdfh));
                 }
@@ -182,10 +240,10 @@ fn request_eocd(agent: &Agent, uri: &Uri, filesize: usize) -> Result<Option<Eocd
     find_eocd(from, resp.into_body().into_reader(), filesize)
 }
 
-fn retrieve_eocd(file: &mut File, filesize: usize) -> Result<Option<Eocd>> {
-    file.seek(SeekFrom::End(-(EOCD_CHUNK_SIZE as i64)))?;
-    let from = file.stream_position()? as usize;
-    find_eocd(from, file, filesize)
+fn retrieve_eocd<R: Read + Seek>(mut reader: R, filesize: usize) -> Result<Option<Eocd>> {
+    reader.seek(SeekFrom::End(-(EOCD_CHUNK_SIZE as i64)))?;
+    let from = reader.stream_position()? as usize;
+    find_eocd(from, reader, filesize)
 }
 
 fn find_eocd<R: io::Read>(from: usize, reader: R, filesize: usize) -> Result<Option<Eocd>> {
@@ -199,13 +257,13 @@ fn find_eocd<R: io::Read>(from: usize, reader: R, filesize: usize) -> Result<Opt
         buf[0] = value;
         buf.rotate_left(1);
 
-        if buf == *EOCD {
+        if buf == *SIGNATURE_EOCD {
             if let MaybeEocd32::Eocd32(value) =
                 read_eocd32(&mut reader, from + byte_offset, filesize)?
             {
                 return Ok(Some(value.into()));
             }
-        } else if buf == *EOCD64 {
+        } else if buf == *SIGNATURE_EOCD64 {
             if let Some(value) = read_eocd64(&mut reader, from + byte_offset)? {
                 return Ok(Some(value.into()));
             }
