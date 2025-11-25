@@ -71,6 +71,17 @@ fn read_fh_with_signature<R: Read>(mut reader: R) -> Result<impl io::Read + use<
     Ok(reader)
 }
 
+/// A zip file reader that can be from a HTTP range request or directly from a file on disk.
+///
+/// # Examples
+/// ```
+/// let filesize = None;
+/// let zipfile = AnyZipReader::open("pathtofile.zip", filesize);
+///
+/// while let Some(file) = zipfile.next()? {
+///     let rdr = zipfile.read_file(&file)?;
+/// }
+/// ```
 pub struct AnyZipReader(AnyZipReaderIn);
 
 enum AnyZipReaderIn {
@@ -121,6 +132,8 @@ impl AnyZipReader {
     }
 }
 
+/// An iterator that reads the CDFH headers of a zip file.
+/// Can be used in tandem with [`read_file`] and [`read_file_seekable`] to read a single file from the zip.
 pub struct ZipReader<R: Read> {
     reader: R,
     buf: [u8; 4],
@@ -178,16 +191,6 @@ impl ZipReader<BodyReader<'static>> {
         let reader = resp.into_body().into_reader();
 
         Ok(Self::from_cdfh_reader(reader, eocd.offset))
-    }
-}
-
-impl<R: Read + 'static> ZipReader<R> {
-    pub fn boxed(self) -> ZipReader<Box<dyn io::Read>> {
-        ZipReader {
-            reader: Box::new(self.reader),
-            buf: self.buf,
-            maximum_allowed_offset: self.maximum_allowed_offset,
-        }
     }
 }
 
