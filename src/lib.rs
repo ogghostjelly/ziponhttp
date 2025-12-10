@@ -57,6 +57,12 @@ pub fn read_file_seekable<R: Read + Seek>(
     read_fh_with_signature(reader)
 }
 
+pub fn is_zip_file<R: Read>(mut reader: R) -> Result<bool> {
+    let mut signature = [0; 4];
+    reader.read_exact(&mut signature)?;
+    Ok(signature == *SIGNATURE_FH)
+}
+
 fn read_fh_with_signature<R: Read>(mut reader: R) -> Result<impl io::Read + use<R>> {
     let mut signature = [0; 4];
     reader.read_exact(&mut signature)?;
